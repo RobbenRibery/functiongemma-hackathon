@@ -1,1 +1,1 @@
-python submit.py --team "RibsAndRobs" --location "London"
+python submit.py --team "RibsAndRobs_minimax2.5" --location "London"
