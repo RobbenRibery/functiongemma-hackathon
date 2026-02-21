@@ -214,3 +214,4 @@ server/
 # Leaderboard data
 docs/
 .DS_Store
+.vscode
