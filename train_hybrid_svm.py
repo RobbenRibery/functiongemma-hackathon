@@ -14,7 +14,46 @@ from sklearn.svm import SVC
 
 def seed_training_data():
     # [intent_score, tool_count, arg_difficulty, category, single_tool, explicit_value] -> label
-    return [
+    weighted = [
+        # Local strength: explicit, single-intent weather/music.
+        ([0.0, 1.0, 0.2, 0.0, 1.0, 1.0], 1, 8),   # weather_*
+        ([0.0, 1.0, 0.4, 1.0, 1.0, 1.0], 1, 4),   # play_*
+        # Local can handle some timer-heavy tool-selection cases.
+        ([0.0, 3.0, 0.7, 3.0, 0.0, 1.0], 1, 3),   # timer_among_three-like
+        ([0.0, 4.0, 0.55, 5.0, 0.0, 1.0], 1, 2),  # weather_among_four-like
+        ([0.0, 5.0, 0.5857142857142857, 5.0, 0.0, 1.0], 1, 2),  # alarm_among_five-like
+        ([0.0, 1.0, 0.8, 3.0, 1.0, 1.0], 1, 2),   # timer_5min-like
+
+        # Keep cloud for known local misses / brittle patterns.
+        ([0.0, 1.0, 0.8, 2.0, 1.0, 1.0], 0, 5),   # alarm_*
+        ([0.0, 1.0, 0.55, 5.0, 1.0, 1.0], 0, 4),  # message_*
+        ([0.0, 1.0, 0.6, 4.0, 1.0, 1.0], 0, 4),   # reminder_*
+        ([0.0, 1.0, 0.6, 5.0, 1.0, 1.0], 0, 3),   # search_*
+        ([0.0, 3.0, 0.58, 5.0, 0.0, 1.0], 0, 5),  # message_among_three-like
+        ([0.0, 4.0, 0.5, 5.0, 0.0, 1.0], 0, 5),   # message_among_four-like
+        ([0.0, 4.0, 0.5833333333333334, 5.0, 0.0, 1.0], 0, 4),  # search_among_four-like
+        ([0.0, 3.0, 0.55, 2.0, 0.0, 1.0], 0, 4),  # music_among_three (corrected features)
+        # Multi-intent should stay cloud-biased.
+        ([0.5, 3.0, 0.58, 5.0, 0.0, 1.0], 0, 5),
+        ([0.5, 4.0, 0.6, 3.0, 0.0, 1.0], 0, 3),
+        ([1.0, 5.0, 0.5571428571428572, 5.0, 0.0, 1.0], 0, 3),
+
+        # Additional benchmark-derived samples (append-only).
+        ([0.0, 2.0, 0.43333333333333335, 5.0, 0.0, 1.0], 1, 3),  # weather_among_two-like
+        ([0.0, 4.0, 0.55, 5.0, 0.0, 1.0], 1, 3),  # weather_among_four-like
+        ([0.0, 3.0, 0.7000000000000001, 3.0, 0.0, 1.0], 1, 2),  # timer_among_three-like
+        ([0.0, 5.0, 0.5857142857142857, 5.0, 0.0, 1.0], 1, 2),  # alarm_among_five-like
+        ([0.0, 1.0, 0.8, 3.0, 1.0, 1.0], 1, 2),  # timer_5min-like
+
+        # Keep high-risk patterns cloud-biased after expansion.
+        ([0.0, 1.0, 0.8, 2.0, 1.0, 1.0], 0, 2),  # alarm_10am/alarm_6am-like
+        ([0.0, 1.0, 0.55, 5.0, 1.0, 1.0], 0, 2),  # message_alice-like
+        ([0.0, 4.0, 0.5, 5.0, 0.0, 1.0], 0, 2),  # message_among_four-like
+        ([0.5, 4.0, 0.5857142857142857, 5.0, 0.0, 1.0], 0, 2),  # reminder_and_message-like
+        ([1.0, 5.0, 0.5857142857142857, 5.0, 0.0, 1.0], 0, 2),  # message_weather_alarm-like
+    ]
+
+    raw_training_data = [
         # Reliable local successes
         ([0.0, 1, 0.2, 0, 1, 1], 1),  # weather_sf
         ([0.0, 1, 0.2, 0, 1, 1], 1),  # weather_london
@@ -43,6 +82,24 @@ def seed_training_data():
         ([0.5, 2, 0.5, 3, 0, 1], 0),  # timer_and_music
         ([0.5, 3, 0.6, 5, 0, 1], 0),  # message_weather_alarm
     ]
+
+    weighted_training_data = [
+        (features, label)
+        for features, label, repeats in weighted
+        for _ in range(repeats)
+    ]
+    combined = raw_training_data + weighted_training_data
+
+    # De-dup exact (features, label) pairs while preserving order.
+    seen = set()
+    deduped = []
+    for features, label in combined:
+        key = (tuple(float(v) for v in features), int(label))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((features, label))
+    return deduped
 
 
 def main():

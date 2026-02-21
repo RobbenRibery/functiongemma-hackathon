@@ -78,7 +78,7 @@ def generate_cloud(messages, tools):
     start_time = time.time()
 
     gemini_response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-flash-lite",
         contents=contents,
         config=types.GenerateContentConfig(tools=gemini_tools),
     )
@@ -101,12 +101,14 @@ def generate_cloud(messages, tools):
 
 
 # Regex-based query decomposition (inlined for single-file submission)
+_DECOMP_ACTION_HINT = r"(?:set|play|remind|send|text|message|check|get|find|look\s+up|search|create|wake)\b"
 _DECOMP_CONJUNCTION = re.compile(
-    r"\s*(?:,\s*and\s+|\s+and\s+|\s+then\s+|\s+also\s+|\s+after\s+)\s*",
+    rf"\s*(?:,\s*and\s+(?={_DECOMP_ACTION_HINT})|\s+and\s+(?={_DECOMP_ACTION_HINT})|\s+then\s+(?={_DECOMP_ACTION_HINT})|\s+also\s+(?={_DECOMP_ACTION_HINT})|\s+after\s+(?={_DECOMP_ACTION_HINT}))\s*",
     re.IGNORECASE,
 )
-_DECOMP_LIST_SEP = re.compile(r"\s*[,;]\s*")
+_DECOMP_LIST_SEP = re.compile(rf"\s*[,;]\s*(?={_DECOMP_ACTION_HINT})", re.IGNORECASE)
 _DECOMP_LEADING = re.compile(r"^\s*(?:and|then|also|after)\s+", re.IGNORECASE)
+_DECOMP_TRAILING_PUNCT = re.compile(r"^[\s,;:.!?]+|[\s,;:.!?]+$")
 
 
 def _decompose_query(user_text):
@@ -118,7 +120,11 @@ def _decompose_query(user_text):
     flat = []
     for seg in segments:
         flat.extend(_DECOMP_LIST_SEP.split(seg))
-    result = [_DECOMP_LEADING.sub("", s).strip() for s in flat if s and s.strip()]
+    result = [
+        _DECOMP_TRAILING_PUNCT.sub("", _DECOMP_LEADING.sub("", s).strip())
+        for s in flat
+        if s and s.strip()
+    ]
     return result if result else []
 
 
@@ -132,8 +138,16 @@ _CATEGORY_MAP = [
 
 
 def _load_svm_gate(path="svm_gate.pkl"):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    """Load serialized SVM gate if present, otherwise return None."""
+    candidate_paths = [
+        path,
+        os.path.join(os.path.dirname(__file__), path),
+    ]
+    for candidate in candidate_paths:
+        if os.path.exists(candidate):
+            with open(candidate, "rb") as f:
+                return pickle.load(f)
+    return None
 
 
 _SVM_GATE = _load_svm_gate()
@@ -184,8 +198,26 @@ def _extract_features(user_text, tools):
     ]
 
 
+def _fallback_predict_local(features):
+    """
+    Submission-safe fallback when svm_gate.pkl is unavailable.
+    Bias local for simple weather/music-like single-intent requests only.
+    """
+    intent_score, tool_count, arg_difficulty, category, single_tool, explicit_value = features
+    return bool(
+        intent_score <= 0.0
+        and explicit_value >= 1.0
+        and (
+            (single_tool >= 1.0 and category in (0.0, 1.0) and arg_difficulty <= 0.45)
+            or (tool_count <= 2.0 and category == 0.0 and arg_difficulty <= 0.30)
+        )
+    )
+
+
 def _svm_predict_local(features, gate=_SVM_GATE):
-    """Return True when SVM predicts the query can be handled locally (label=1)."""
+    """Return True when gate predicts the query can be handled locally (label=1)."""
+    if gate is None:
+        return _fallback_predict_local(features)
     scaler, clf = gate["scaler"], gate["clf"]
     X = np.array([features], dtype=float)
     X_scaled = scaler.transform(X)
@@ -193,15 +225,17 @@ def _svm_predict_local(features, gate=_SVM_GATE):
 
 
 def _route_subquery(user_text, tools):
-    """SVM gate: predict=1 → local cactus, predict=0 → cloud."""
-    features = _extract_features(user_text, tools)
+    """Route locally first; fallback to cloud on suspiciously-fast local response."""
     msgs = [{"role": "user", "content": user_text}]
-    if _svm_predict_local(features):
-        result = generate_cactus(msgs, tools)
-        result["source"] = "on-device"
-    else:
+    result = generate_cactus(msgs, tools)
+    result["source"] = "on-device"
+
+    # Local responses with near-zero latency are usually malformed/empty;
+    # reroute those to cloud for recovery.
+    if result.get("total_time_ms", 0.0) < 0.05:
         result = generate_cloud(msgs, tools)
         result["source"] = "cloud"
+
     return result
 
 
