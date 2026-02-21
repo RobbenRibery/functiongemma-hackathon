@@ -11,7 +11,7 @@ from google.genai import types
 
 
 def generate_cactus(messages, tools):
-    """Run function calling on-device via FunctionGemma + Cactus."""
+    """Run function calling on-device via FunctionGemma + Cactus with nucleus sampling."""
     model = cactus_init(functiongemma_path)
 
     cactus_tools = [{
@@ -26,6 +26,9 @@ def generate_cactus(messages, tools):
         force_tools=True,
         max_tokens=256,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
+        temperature=0.2,
+        top_p=0.95,
+        top_k=50,
     )
 
     cactus_destroy(model)
