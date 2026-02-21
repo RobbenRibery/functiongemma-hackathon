@@ -3,10 +3,13 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
+import asyncio
 import json, os, pickle, re, time
+import threading
+from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 from cactus import cactus_init, cactus_complete, cactus_destroy
 from google import genai
 from google.genai import types
@@ -80,7 +83,13 @@ def generate_cloud(messages, tools):
     gemini_response = client.models.generate_content(
         model="gemini-2.5-flash-lite",
         contents=contents,
-        config=types.GenerateContentConfig(tools=gemini_tools),
+        config=types.GenerateContentConfig(
+            tools=gemini_tools,
+            # Minimize deliberate reasoning latency for routing speed.
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            temperature=0.0,
+            max_output_tokens=64,
+        ),
     )
 
     total_time_ms = (time.time() - start_time) * 1000
@@ -109,9 +118,86 @@ _DECOMP_CONJUNCTION = re.compile(
 _DECOMP_LIST_SEP = re.compile(rf"\s*[,;]\s*(?={_DECOMP_ACTION_HINT})", re.IGNORECASE)
 _DECOMP_LEADING = re.compile(r"^\s*(?:and|then|also|after)\s+", re.IGNORECASE)
 _DECOMP_TRAILING_PUNCT = re.compile(r"^[\s,;:.!?]+|[\s,;:.!?]+$")
+_DECOMP_MAX_SUBQUERIES = 2
 
 
-def _decompose_query(user_text):
+class BaseMode:
+    """Marker base class for structured routing payloads."""
+
+
+@dataclass(frozen=True)
+class SubQuery(BaseMode):
+    sub_query: str
+    destination: Literal["cloud", "local"]
+
+
+_CACTUS_CALL_LOCK = threading.Lock()
+
+
+def _subquery_destination(sub_query: str, tools) -> Literal["cloud", "local"]:
+    """
+    History-driven hybrid destination policy.
+    Prefer local where prior runs are stable; use cloud for historically brittle intents.
+    """
+    lowered = sub_query.lower()
+    tool_count = float(len(tools))
+    features = _extract_features(sub_query, tools)
+    is_svm_local = _svm_predict_local(features)
+
+    is_weather = bool(re.search(r"\b(?:weather|forecast)\b", lowered))
+    is_music = bool(re.search(r"\b(?:play|music|song|playlist)\b", lowered))
+    is_alarm = bool(re.search(r"\b(?:alarm|wake)\b", lowered))
+    is_timer = bool(re.search(r"\btimer\b", lowered))
+    is_reminder = bool(re.search(r"\b(?:remind|reminder)\b", lowered))
+    is_message = bool(re.search(r"\b(?:message|text|send)\b", lowered))
+    is_search = bool(re.search(r"\b(?:find|look\s+up|search|contacts?)\b", lowered))
+
+    has_numeric = bool(re.search(r"\b\d+(?::\d+)?\b", lowered))
+    has_proper_name = bool(re.search(r"\b[A-Z][a-z]+\b", sub_query))
+    has_ambiguous_pronoun = bool(re.search(r"\b(?:him|her|them|it|that)\b", lowered))
+    token_count = len([t for t in re.split(r"\s+", lowered) if t])
+
+    # Reliability prior from observed benchmark history.
+    local_score = 0.2
+    if is_weather:
+        local_score += 1.4
+    if is_music:
+        local_score += 0.2
+    if is_search:
+        local_score -= 0.1
+    if is_timer:
+        local_score -= 0.6
+    if is_alarm:
+        local_score += 0.1
+    if is_reminder:
+        local_score -= 0.8
+    if is_message:
+        local_score -= 0.7
+
+    if has_numeric and is_alarm:
+        local_score += 0.35
+    if has_numeric and is_timer:
+        local_score -= 0.25
+    if has_proper_name and (is_weather or is_search):
+        local_score += 0.15
+    if has_ambiguous_pronoun and (is_message or is_search):
+        local_score -= 0.7
+
+    if tool_count >= 4.0:
+        local_score -= 0.65
+    elif tool_count >= 2.0:
+        local_score -= 0.25
+    if token_count >= 11:
+        local_score -= 0.3
+    if token_count <= 6 and (is_weather or is_alarm):
+        local_score += 0.2
+
+    # SVM is a soft tie-breaker only.
+    local_score += 0.25 if is_svm_local else -0.1
+    return "local" if local_score >= 0.05 else "cloud"
+
+
+def _decompose_query(user_text, tools):
     """Split compound query into sub-queries via regex."""
     if not user_text or not user_text.strip():
         return []
@@ -125,7 +211,12 @@ def _decompose_query(user_text):
         for s in flat
         if s and s.strip()
     ]
-    return result if result else []
+    if not result:
+        return []
+    if len(result) > _DECOMP_MAX_SUBQUERIES:
+        # Keep first action explicit, fold remaining actions into the second slot.
+        result = [result[0], " and ".join(result[1:])]
+    return [SubQuery(sub_query=s, destination=_subquery_destination(s, tools)) for s in result]
 
 
 _CATEGORY_MAP = [
@@ -224,19 +315,45 @@ def _svm_predict_local(features, gate=_SVM_GATE):
     return clf.predict(X_scaled)[0] == 1
 
 
-def _route_subquery(user_text, tools):
-    """Route locally first; fallback to cloud on suspiciously-fast local response."""
-    msgs = [{"role": "user", "content": user_text}]
-    result = generate_cactus(msgs, tools)
+def _route_subquery(sub_query, tools):
+    """Route each sub-query to destination engine with local safety fallback."""
+    msgs = [{"role": "user", "content": sub_query.sub_query}]
+    if sub_query.destination == "cloud":
+        result = generate_cloud(msgs, tools)
+        result["source"] = "cloud"
+        # If cloud returns nothing, try local once as a recovery path.
+        if not result.get("function_calls"):
+            with _CACTUS_CALL_LOCK:
+                local_result = generate_cactus(msgs, tools)
+            if local_result.get("function_calls"):
+                local_result["source"] = "on-device"
+                return local_result
+        return result
+
+    # Cactus native stack can crash on concurrent calls; serialize local invocations.
+    with _CACTUS_CALL_LOCK:
+        result = generate_cactus(msgs, tools)
     result["source"] = "on-device"
 
-    # Local responses with near-zero latency are usually malformed/empty;
-    # reroute those to cloud for recovery.
-    if result.get("total_time_ms", 0.0) < 0.05:
+    # Recover from malformed/empty ultra-fast local responses.
+    if result.get("total_time_ms", 0.0) < 0.05 or not result.get("function_calls"):
         result = generate_cloud(msgs, tools)
         result["source"] = "cloud"
 
     return result
+
+
+async def _route_subqueries_taskgroup(sub_queries, tools):
+    """Route decomposed sub-queries concurrently via asyncio.TaskGroup."""
+    results = [None] * len(sub_queries)
+
+    async def run_one(idx, sub_query):
+        results[idx] = await asyncio.to_thread(_route_subquery, sub_query, tools)
+
+    async with asyncio.TaskGroup() as tg:
+        for idx, sub_query in enumerate(sub_queries):
+            tg.create_task(run_one(idx, sub_query))
+    return results
 
 
 def generate_hybrid(messages, tools):
@@ -246,18 +363,22 @@ def generate_hybrid(messages, tools):
     )
 
     start = time.time()
-    sub_queries = _decompose_query(user_text)
+    sub_queries = _decompose_query(user_text, tools)
     decompose_ms = (time.time() - start) * 1000
+    if sub_queries:
+        for idx, sq in enumerate(sub_queries, 1):
+            print(f"[route] subquery {idx}: {sq.destination} | {sq.sub_query}")
+    else:
+        print(f"[route] subquery 1: local | {user_text}")
 
     if not sub_queries or len(sub_queries) <= 1:
-        query = sub_queries[0] if sub_queries else user_text
+        query = sub_queries[0] if sub_queries else SubQuery(sub_query=user_text, destination="local")
         result = _route_subquery(query, tools)
         result["total_time_ms"] += decompose_ms
         return result
 
     fan_start = time.time()
-    with ThreadPoolExecutor(max_workers=len(sub_queries)) as pool:
-        results = list(pool.map(lambda sq: _route_subquery(sq, tools), sub_queries))
+    results = asyncio.run(_route_subqueries_taskgroup(sub_queries, tools))
     fan_ms = (time.time() - fan_start) * 1000
 
     all_calls = []
