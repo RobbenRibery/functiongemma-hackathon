@@ -2,19 +2,22 @@
 
 import re
 
-# Phase 1: split on conjunction phrases (order matters: Oxford comma before bare "and")
+# Split only when the next fragment looks like a new action.
+_ACTION_HINT = r"(?:set|play|remind|send|text|message|check|get|find|look\s+up|search|create|wake)\b"
+# Phase 1: split on conjunction phrases for action transitions.
 _CONJUNCTION_PATTERN = re.compile(
-    r"\s*(?:,\s*and\s+|\s+and\s+|\s+then\s+|\s+also\s+|\s+after\s+)\s*",
+    rf"\s*(?:,\s*and\s+(?={_ACTION_HINT})|\s+and\s+(?={_ACTION_HINT})|\s+then\s+(?={_ACTION_HINT})|\s+also\s+(?={_ACTION_HINT})|\s+after\s+(?={_ACTION_HINT}))\s*",
     re.IGNORECASE,
 )
-# Phase 2: split on list separators
-_LIST_SEP_PATTERN = re.compile(r"\s*[,;]\s*")
+# Phase 2: split list separators only when followed by an action.
+_LIST_SEP_PATTERN = re.compile(rf"\s*[,;]\s*(?={_ACTION_HINT})", re.IGNORECASE)
 # Strip leading connector words from segments
 _LEADING_CONNECTOR = re.compile(r"^\s*(?:and|then|also|after)\s+", re.IGNORECASE)
+_TRAILING_PUNCT = re.compile(r"^[\s,;:.!?]+|[\s,;:.!?]+$")
 
 
 def _strip_connector(s: str) -> str:
-    return _LEADING_CONNECTOR.sub("", s).strip()
+    return _TRAILING_PUNCT.sub("", _LEADING_CONNECTOR.sub("", s).strip())
 
 
 def decompose_query(user_text: str) -> list[str]:
